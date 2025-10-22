@@ -19,6 +19,60 @@ S3_DATA_PREFIX = st.secrets.get('s3_data_prefix', '')
 S3_BASE_MODEL_PREFIX = st.secrets.get('s3_model_base_prefix', '')
 S3_ADAPTER_PREFIX = st.secrets.get('s3_model_adapter_prefix', '')
 
+def _generate_prefix_variants(prefix: str) -> list[str]:
+    """Return common prefix variants to tolerate small misconfigurations.
+
+    Examples:
+      "cfde/data/" -> ["cfde/data/", "cfde/data", "cfde/", ""]
+    """
+    try:
+        p = (prefix or "").strip()
+        variants = []
+        # as-is
+        variants.append(p if p.endswith('/') else (p + '/' if p else ''))
+        # trim trailing slash
+        if p:
+            variants.append(p.rstrip('/'))
+        # parent (drop last segment)
+        if '/' in p.strip('/'):
+            parent = p.strip('/').split('/')[:-1]
+            variants.append(('/'.join(parent) + '/') if parent else '')
+        # empty
+        variants.append('')
+        # de-duplicate while preserving order
+        seen = set()
+        uniq = []
+        for v in variants:
+            if v not in seen:
+                uniq.append(v)
+                seen.add(v)
+        return uniq
+    except Exception:
+        return [prefix or '', '']
+
+def _s3_try_download_first(s3_client, bucket: str, candidate_keys: list[str], dest_path: str) -> str | None:
+    """Try candidate keys in order; return the first working key or None.
+    Shows compact diagnostics in the Streamlit UI if all fail.
+    """
+    errors = []
+    tried = []
+    for key in candidate_keys:
+        if not key:
+            continue
+        try:
+            s3_client.download_file(bucket, key, dest_path)
+            return key
+        except Exception as e:
+            tried.append(key)
+            errors.append(str(e))
+            continue
+    if tried:
+        # Limit noise while surfacing actionable info
+        st.error(
+            "S3 download failed. Bucket '" + str(bucket) + "'. Tried keys: " + ", ".join(tried[:6]) + ("..." if len(tried) > 6 else "")
+        )
+    return None
+
 @st.cache_resource
 def get_s3_client():
     access_key = st.secrets.get("aws_access_key_id", None)
@@ -52,14 +106,36 @@ def load_json_data(filename, s3_key):
         st.warning(f"Missing local {filename} and S3 is not configured.")
         return {}
     s3 = get_s3_client()
-    try:
-        with st.spinner(f"Loading {filename} (one-time operation)..."):
-            s3.download_file(S3_BUCKET_NAME, s3_key, cache_path)
-            with open(cache_path, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        st.error(f"Error downloading {filename}: {e}")
-        return {}
+    # Build tolerant candidate keys
+    base = os.path.basename(s3_key)
+    variants = _generate_prefix_variants(S3_DATA_PREFIX)
+    candidate_keys = []
+    # Explicit s3_key first
+    candidate_keys.append(s3_key)
+    # Prefix variants with basename
+    for pv in variants:
+        if pv:
+            candidate_keys.append((pv if pv.endswith('/') else pv + '/') + base)
+        else:
+            candidate_keys.append(base)
+    # De-duplicate
+    seen = set()
+    candidate_keys = [k for k in candidate_keys if not (k in seen or seen.add(k))]
+    with st.spinner(f"Loading {filename} (one-time operation)..."):
+        used_key = _s3_try_download_first(s3, S3_BUCKET_NAME, candidate_keys, cache_path)
+        if used_key:
+            try:
+                with open(cache_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                st.error(f"Loaded {filename} from s3://{S3_BUCKET_NAME}/{used_key} but failed to parse JSON: {e}")
+                return {}
+        else:
+            st.error(
+                f"Unable to fetch {filename} from bucket '{S3_BUCKET_NAME}'. Ensure one of these paths exists: "
+                + ", ".join(candidate_keys[:6]) + ("..." if len(candidate_keys) > 6 else "")
+            )
+            return {}
 
 
 def _extract_ids_and_embs_from_loaded(loaded, possible_ids_files: list[str]):
@@ -205,11 +281,36 @@ def load_embeddings_and_index():
     # 3) S3 ready-made ids/index (only if S3 enabled)
     if s3_enabled():
         s3 = get_s3_client()
-        try:
-            progress_text.text("Downloading author ids/index (one-time operation)...")
-            progress_bar.progress(25)
-            s3.download_file(S3_BUCKET_NAME, f"{S3_DATA_PREFIX}author_ids.pkl", ids_path)
-            s3.download_file(S3_BUCKET_NAME, f"{S3_DATA_PREFIX}faiss_index.bin", index_path)
+        progress_text.text("Downloading author ids/index (one-time operation)...")
+        progress_bar.progress(25)
+        # Build tolerant candidate keys for ids and index
+        variants = _generate_prefix_variants(S3_DATA_PREFIX)
+        ids_candidates = []
+        idx_candidates = []
+        # add explicit default
+        ids_candidates.append(f"{S3_DATA_PREFIX}author_ids.pkl")
+        idx_candidates.append(f"{S3_DATA_PREFIX}faiss_index.bin")
+        base_pairs = [("author_ids.pkl", ids_candidates), ("faiss_index.bin", idx_candidates)]
+        for base_name, coll in base_pairs:
+            for pv in variants:
+                if pv:
+                    coll.append((pv if pv.endswith('/') else pv + '/') + base_name)
+                else:
+                    coll.append(base_name)
+        # de-duplicate
+        def _dedup(lst):
+            seen = set()
+            out = []
+            for k in lst:
+                if k and k not in seen:
+                    out.append(k)
+                    seen.add(k)
+            return out
+        ids_candidates = _dedup(ids_candidates)
+        idx_candidates = _dedup(idx_candidates)
+        used_ids_key = _s3_try_download_first(s3, S3_BUCKET_NAME, ids_candidates, ids_path)
+        used_idx_key = _s3_try_download_first(s3, S3_BUCKET_NAME, idx_candidates, index_path)
+        if used_ids_key and used_idx_key:
             progress_bar.progress(75)
             import faiss
             index = faiss.read_index(index_path)
@@ -219,38 +320,44 @@ def load_embeddings_and_index():
             progress_text.empty()
             progress_bar.empty()
             return author_ids, index
-        except Exception:
-            pass
 
         # 4) S3 build from author_embeddings (robust)
-        try:
-            progress_text.text("Building index from S3 author embeddings...")
-            progress_bar.progress(25)
-            emb_key = f"{S3_DATA_PREFIX}author_embeddings.pkl"
-            emb_cache = f"{CACHE_DIR}/author_embeddings.pkl"
-            s3.download_file(S3_BUCKET_NAME, emb_key, emb_cache)
-            with open(emb_cache, 'rb') as f:
-                loaded = pickle.load(f)
-            possible_ids_files = [
-                os.path.join(CACHE_DIR, 'author_ids.pkl'),
-                os.path.join(CACHE_DIR, 'author_ids.npy'),
-            ]
-            author_ids, embs = _extract_ids_and_embs_from_loaded(loaded, possible_ids_files)
-            import faiss
-            dim = embs.shape[1]
-            index = faiss.IndexFlatL2(dim)
-            index.add(embs)
-            # Save cache for future
-            faiss.write_index(index, index_path)
-            with open(ids_path, 'wb') as f:
-                pickle.dump(author_ids, f)
-            progress_bar.progress(100)
-            progress_text.empty()
-            progress_bar.empty()
-            return author_ids, index
-        except Exception as e:
-            progress_text.error(f"S3 embeddings build failed: {e}")
-            progress_bar.empty()
+        progress_text.text("Building index from S3 author embeddings...")
+        progress_bar.progress(25)
+        emb_variants = _generate_prefix_variants(S3_DATA_PREFIX)
+        emb_candidates = [f"{S3_DATA_PREFIX}author_embeddings.pkl"]
+        for pv in emb_variants:
+            if pv:
+                emb_candidates.append((pv if pv.endswith('/') else pv + '/') + 'author_embeddings.pkl')
+            else:
+                emb_candidates.append('author_embeddings.pkl')
+        emb_candidates = list(dict.fromkeys([k for k in emb_candidates if k]))
+        emb_cache = f"{CACHE_DIR}/author_embeddings.pkl"
+        used_emb_key = _s3_try_download_first(s3, S3_BUCKET_NAME, emb_candidates, emb_cache)
+        if used_emb_key:
+            try:
+                with open(emb_cache, 'rb') as f:
+                    loaded = pickle.load(f)
+                possible_ids_files = [
+                    os.path.join(CACHE_DIR, 'author_ids.pkl'),
+                    os.path.join(CACHE_DIR, 'author_ids.npy'),
+                ]
+                author_ids, embs = _extract_ids_and_embs_from_loaded(loaded, possible_ids_files)
+                import faiss
+                dim = embs.shape[1]
+                index = faiss.IndexFlatL2(dim)
+                index.add(embs)
+                # Save cache for future
+                faiss.write_index(index, index_path)
+                with open(ids_path, 'wb') as f:
+                    pickle.dump(author_ids, f)
+                progress_bar.progress(100)
+                progress_text.empty()
+                progress_bar.empty()
+                return author_ids, index
+            except Exception as e:
+                progress_text.error(f"S3 embeddings build failed after downloading {used_emb_key}: {e}")
+                progress_bar.empty()
 
     # If we reached here, nothing worked
     st.error("No local index/embeddings found and S3 not available. Provide local author_ids.pkl+faiss_index.bin or author_embeddings (supported formats) in cfde_demo/data.")
