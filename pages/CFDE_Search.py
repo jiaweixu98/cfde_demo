@@ -28,8 +28,8 @@ st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
 
 # Fixed model names
-MODEL_NAME_EXPERTISE = "gpt-4o"
-MODEL_NAME_RERANKING = "gpt-4o-mini"
+MODEL_NAME_EXPERTISE = "gpt-4.1"
+MODEL_NAME_RERANKING = "gpt-4.1-mini"
 
 # Progressive loading (show UI only on first render to avoid flicker on first input)
 status = st.empty()
@@ -137,14 +137,15 @@ def try_generate_query(user_input: str, user_background: str, model_name: str, p
     "Generate a short, specific expertise query focused on that gap for retrieval in a BERT-based vector database. "
     "Focus on the researcher's input, consider the researcher's previous publications and their input, "
     "and give the most accurate, content-based query possible."
-    "BERT-based retrieval cannot understand negation or exclusion (e.g., 'not', 'without', 'exclude'). "
+    "BERT-based retrieval cannot understand negation or exclusion (e.g., 'not', 'without', 'exclude'), and some words like 'recent', 'exploration', 'expertise', are not helpful for the semantic-based retrieval. "
     "If the researcher gives a negative or exclusive query (e.g., 'medicine but not AI'), "
     "rephrase it into a positive form that naturally avoids the undesired topic "
     "(e.g., 'traditional clinical medicine'). "
     "Your query should thus always be phrased in a positive, descriptive way that conveys the intended scope clearly. "
     "If the researcher already specifies or implies a query, preserve it with minimal proofreading and only rephrase for clarity and non-negativity. "
     "Most importantly, the user's input is top priority, modify your query to align with the user's most recent input as much as possible. e.g., if the user ask if we can just serach 'medicine', do it even if it is not ideal. Instruction following is top priority. "
-    "STRICT OUTPUT FORMAT: Output only [QUERY] the final query text with the expertise gap in bold [/QUERY]. No explanations, no extra text."
+    "STRICT OUTPUT FORMAT: Output exactly two sections in order: [QUERY] the final query text with the expertise gap in bold [/QUERY]\n"
+    "[JUSTIFICATION] In first person (use 'I'), one concise sentence explaining why this query best matches the user's needs, focusing on the bolded gap. Refer the researcher as 'you'. [/JUSTIFICATION]"
 )
     past_queries = past_queries or []
     if past_queries:
@@ -163,7 +164,7 @@ def try_generate_query(user_input: str, user_background: str, model_name: str, p
         f"The RESEARCHER's BACKGROUND:\n{user_background}\n\n"
         + past_block +
         f"The researcher's input (can be a gap, a need, or a general description of their research interests, or can be totaly unrelated):\n{user_input}\n\n"
-        "Follow the STRICT OUTPUT FORMAT. Output only [QUERY] the final query text with the expertise gap in bold [/QUERY]. No explanations, no extra text."
+        "Follow the STRICT OUTPUT FORMAT. Output exactly [QUERY]...[/QUERY] and [JUSTIFICATION]...[/JUSTIFICATION] and nothing else."
     )
     # Include prior raw user inputs as separate user-role messages for consistency
     messages_list = [
@@ -182,16 +183,23 @@ def try_generate_query(user_input: str, user_background: str, model_name: str, p
     response = client.chat.completions.create(
         model=model_name,
         messages=messages_list,
-        temperature=0.2,
     )
     full_response = response.choices[0].message.content or ""
-    # Parse [EXPLANATION] and [QUERY] sections
+    # Parse [JUSTIFICATION]/[EXPLANATION] and [QUERY] sections
     explanation = ""
     query = full_response.strip()
     try:
         q_match = re.search(r"\[QUERY\](.*?)(\[/QUERY\]|$)", full_response, re.DOTALL | re.IGNORECASE)
         if q_match:
             query = q_match.group(1).strip()
+        j_match = re.search(r"\[JUSTIFICATION\](.*?)(\[/JUSTIFICATION\]|$)", full_response, re.DOTALL | re.IGNORECASE)
+        if j_match:
+            explanation = j_match.group(1).strip()
+        else:
+            # Backward compatibility if a model returns [EXPLANATION]
+            e_match = re.search(r"\[EXPLANATION\](.*?)(\[/EXPLANATION\]|$)", full_response, re.DOTALL | re.IGNORECASE)
+            if e_match:
+                explanation = e_match.group(1).strip()
     except Exception:
         pass
     return query, (explanation or ""), full_response
@@ -222,7 +230,6 @@ def llm_is_confirmation(user_text: str, query: str, model_name: str) -> bool:
         response = client.chat.completions.create(
             model=model_name,
             messages=messages_list,
-            temperature=0.0,
             max_tokens=2,
         )
         ans = (response.choices[0].message.content or "").strip().upper()
@@ -385,9 +392,9 @@ def rerank_authors_with_llm_batch(candidates: List[Tuple[str, float]], query: st
     \n\n\n
 For each candidate, provide:
 
-1. A numerical score (integer) from 50 to 100. A score of 50 means not relevant at all, and 100 means perfectly relevant. Avoid using numbers ending in 5 or 0. Only give a score above 90 when you feel it very suitable for the reseracher's needs interms of every aspect of the needs. e.g., if the user mention it should be located in US, give a score above 90 only if the candidate is from US.
-2. A brief but very specific justification that use very specific detail to highlight how the candidate can benefit or can not benefit the current researcher by mitigating the identified expertise gap. (one sentence). If there are any points that the candidate do not meet the needs, say it in the justification. Everything should be focused on address the provided or not provided expertise gap and nothing else. Use markdown bold to highlight the relevant expertise gap. Always use the candidate's name in stead of "the candidate" or "the researcher".
-3. INSTITUTION: The candidate's institution in the format "Institution Name, Country" only. Do not include departments, cities, states, postal codes, or extra punctuation. If uncertain, best-effort guess.
+1. A numerical score (integer) from 50 to 100. A score of 50 means not relevant at all, and 100 means perfectly relevant. Avoid using numbers ending in 5 or 0. Only give a score above 90 when you feel it very suitable for the reseracher's needs interms of every aspect of the needs. e.g., if the user mention it should be located in US, give a score above 90 only if the candidate is from US. You can give a score above 80 if some aspects match the needs but not all.
+2. A brief but specific justification that use specific detail to highlight how the candidate can benefit or can not benefit the current researcher by mitigating the identified expertise gap. (one sentence). Give evidence. If there are severe points that the candidate do not meet the needs, say it in the justification. Everything should be focused on address the provided or not provided expertise gap and nothing else. Use markdown bold to highlight the relevant expertise gap. Always use the candidate's name in stead of "the candidate" or "the researcher". If can not tell the gender, use "they".
+3. INSTITUTION: The candidate's institution in the format "Institution Name (try to include the department name if possible), Country" only. Do not include departments, cities, states, postal codes, or extra punctuation. If uncertain, best-effort guess.
 
     CANDIDATE 1's name:
     SCORE: [score]
@@ -413,7 +420,6 @@ For each candidate, provide:
         messages=[
             {"role": f"system", "content": f"You are an academic collaboration expert specialized in evaluating potential research partnerships. Speak in a 'you' voice, as if you are directly addressing the researcher. The researcher's needs: {prompt}"},
         ],
-        temperature=0.2,
     )
 
     full = response.choices[0].message.content or ""
@@ -495,11 +501,11 @@ if st.session_state.get("pending_generate_query", False):
             improved = f"Original query: {st.session_state['search_query']}\nUser feedback (Most important, follow it as much as possible): {base_prompt}"
             past_qs = (st.session_state.get("executed_queries", [])
                        + st.session_state.get("proposed_queries", []))
-            query, _, _ = try_generate_query(improved, user_bg, MODEL_NAME_EXPERTISE, past_qs)
+            query, justification, _ = try_generate_query(improved, user_bg, MODEL_NAME_EXPERTISE, past_qs)
         else:
             past_qs = (st.session_state.get("executed_queries", [])
                        + st.session_state.get("proposed_queries", []))
-            query, _, _ = try_generate_query(base_prompt, user_bg, MODEL_NAME_EXPERTISE, past_qs)
+            query, justification, _ = try_generate_query(base_prompt, user_bg, MODEL_NAME_EXPERTISE, past_qs)
 
         # Ensure the proposed query is not a duplicate of prior proposed/executed queries
         try:
@@ -511,7 +517,7 @@ if st.session_state.get("pending_generate_query", False):
                     f"User feedback (Most important, follow it as much as possible): {base_prompt}\n" +
                     "Avoid repeating any previous queries. Propose a distinct angle."
                 )
-                query, _, _ = try_generate_query(reinforce, user_bg, MODEL_NAME_EXPERTISE, past_qs)
+                query, justification, _ = try_generate_query(reinforce, user_bg, MODEL_NAME_EXPERTISE, past_qs)
                 attempts += 1
         except Exception:
             pass
@@ -536,9 +542,16 @@ if st.session_state.get("pending_generate_query", False):
         st.session_state["reranked_candidates_number"] = 0
         st.session_state["rerank_total_batches"] = 0
         st.session_state["rerank_batches_done"] = 0
+        msg_content = f"Based on your request, I propose this search query:\n\n**{query}**"
+        try:
+            if justification:
+                msg_content += f"\n\n{justification}"
+        except Exception:
+            pass
+        msg_content += "\n\nWould you like me to proceed with this query, or would you like to refine it further? Respond with 'Proceed' or provide feedback to improve the query."
         st.session_state.messages.append({
             "role": "assistant",
-            "content": f"Based on your request, I propose this search query:\n\n**{query}**\n\nWould you like me to proceed with this query, or would you like to refine it further? Respond with 'Proceed' or provide feedback to improve the query."
+            "content": msg_content
         })
     except Exception as e:
         st.session_state.messages.append({
@@ -583,9 +596,6 @@ with col_left:
     display_name = get_user_name(user_id_for_title)
     st.title(f"Hello {display_name}! Let me know what are your teaming needs!")
     st.page_link("https://cfdegraph.vercel.app/", label="Click to Explore CFDE Knowledge Graph", icon="🌎")
-    # Fixed model choices
-    model_name_expertise = MODEL_NAME_EXPERTISE
-    model_name_reranking = MODEL_NAME_RERANKING
     # Chat transcript
     chat_container = st.container()
     with chat_container:
@@ -638,7 +648,18 @@ with col_right:
             not_reranked_order = [rid for rid, _ in initial_list if rid not in reranked_map]
             ordered_ids = [rid for rid, _ in reranked_order] + not_reranked_order
 
-            for i, rid in enumerate(ordered_ids):
+            # Filter out candidates with score below 60
+            filtered_ordered_ids = []
+            for rid in ordered_ids:
+                if rid in reranked_map:
+                    score = reranked_map[rid][0]
+                    if score >= 65:  # Only show candidates with score >= 60
+                        filtered_ordered_ids.append(rid)
+                else:
+                    # For non-reranked candidates, show them (they don't have LLM scores yet)
+                    filtered_ordered_ids.append(rid)
+
+            for i, rid in enumerate(filtered_ordered_ids):
                 details = get_author_details(rid)
 
                 # Prefer cleaned institution if available and valid; otherwise fallback to stored affiliation
@@ -724,7 +745,7 @@ with col_left:
                     "content": "🔁 This query was searched before. Reusing previous results to save time."
                 })
             else:
-                st.session_state["initial_results"] = retrieve_candidates(st.session_state["search_query"], current_user_id, top_k=50)
+                st.session_state["initial_results"] = retrieve_candidates(st.session_state["search_query"], current_user_id, top_k=100)
                 st.session_state["search_complete"] = True
                 # Update executed queries memory and cache
                 try:
@@ -875,7 +896,7 @@ with col_left:
                 user_bg = get_user_background(user_id)
                 past_qs = (st.session_state.get("executed_queries", [])
                            + st.session_state.get("proposed_queries", []))
-                query, _, _ = try_generate_query(prompt, user_bg, MODEL_NAME_EXPERTISE, past_qs)
+                query, justification, _ = try_generate_query(prompt, user_bg, MODEL_NAME_EXPERTISE, past_qs)
                 st.session_state["search_query"] = query
                 # Track proposed queries to avoid repeats on subsequent refinements
                 try:
@@ -885,9 +906,16 @@ with col_left:
                             st.session_state["proposed_queries"] = st.session_state["proposed_queries"][-30:]
                 except Exception:
                     pass
+                msg_content = f"Based on your request, I propose this search query:\n\n**{query}**"
+                try:
+                    if justification:
+                        msg_content += f"\n\n{justification}"
+                except Exception:
+                    pass
+                msg_content += "\n\nWould you like me to proceed with this query, or would you like to refine it further? Respond with 'Proceed' or provide feedback to improve the query."
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": f"Based on your request, I propose this search query:\n\n**{query}**\n\nWould you like me to proceed with this query, or would you like to refine it further? Respond with 'Proceed' or provide feedback to improve the query."
+                    "content": msg_content
                 })
             except Exception as e:
                 st.session_state.messages.append({
